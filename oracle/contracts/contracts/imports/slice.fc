@@ -1,0 +1,36 @@
+#include "constants.fc";
+#include "stdlib.fc";
+
+
+
+(slice, int) slice_uint(slice data, int len) {
+    if (len <= 0) {
+        return (data, 0);
+    }
+
+    throw_unless(error::length_overflow, len <= 256);
+
+    slice num_slice = data.slice_last(len);
+    int value = num_slice~load_uint(len);
+
+    throw_unless(error::number_overflow, value >= 0);
+
+    data~skip_last_bits(len);
+
+    return (data, value);
+}
+
+(slice, int) slice_int(slice data, int len) {
+    if (len <= 0) {
+        return (data, 0);
+    }
+
+    throw_unless(error::length_overflow, len <= 257);
+
+    slice num_slice = data.slice_last(len);
+    int value = num_slice~load_int(len);
+
+    data~skip_last_bits(len);
+
+    return (data, value);
+}

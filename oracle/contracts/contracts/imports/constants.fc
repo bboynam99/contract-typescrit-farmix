@@ -1,0 +1,62 @@
+
+;; ============== constants ==============
+const MAX_DATA_TIMESTAMP_AHEAD_SECONDS = 180; ;; 3 * 60
+const BASE_KEY_LEN = 16;
+const UNSIGNED_METADATA_BITS = 8 * 3;
+const DATA_POINTS_COUNT_BITS = 8 * 3;
+const DATA_POINT_VALUE_BYTE_SIZE_BITS = 8 * 4;
+const DATA_PACKAGES_COUNT_BITS = 8 * 2;
+const FARMIX_MARKER = 0x000001eda7010a0000;
+const FARMIX_MARKER_BITS = 8 * 9;
+const SEND_MODE_CARRY_REMAINING_INBOUD_VALUE = 64;
+const SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS = 2;
+const SEND_FLAG_BOUNCE_IF_FAILED = 16;
+const UNKNOWN_IDX = -100;
+const WORKCHAIN = 0;
+const TIMESTAMP_SIZE = 8 * 6;
+const BOOL_SIZE = 1;
+const SIGNER_COUNT_TRESHOLD_SIZE = 8;
+const INT_32_LEN = 32;
+const INT_16_LEN = 16;
+const DATA_FEED_ID_BITS = 8 * 32;
+const KEY_LENGTH_BITS = DATA_FEED_ID_BITS;
+const MAX_PRICE_VALUE_SIZE_BITS = 8 * 32;
+const int BOUNCEABLE = 0x18;
+const int NON_BOUNCEABLE = 0x10;
+
+
+
+;; =============== errors ================
+
+const int error::typles_lenght_mismatch = 712;
+const int error::unknown_update_mode = 752;
+const int error::number_overflow = 996;
+const int error::length_overflow = 997;
+const int error::typle_empty = 823;
+const int error::data_not_supported_base = 600;
+const int error::timestamp_out_of_range = 200;
+const int error::wrong_data_package_count_base = 100;
+const int error::unique_signers_threshould_not_achived_base = 300;
+
+const int error::halted = 0x9285;
+const int error::price_feed_missing = 0x9284;
+const int error::unknown_op = 0xffff;
+const int error::not_enough_amount = 0xf102;
+const int error::wrong_workchain = 0xf400;
+const int error::not_allowd_sender = 0x9283;
+const int error::wrong_marker = 0xf402;
+
+
+;; ============== op codes ================
+
+const int op::price_request = 0xe384a361;
+const int op::price_response = 0x309C0CDC;
+const int op::price_response_failed = 0x208B0CAC;
+const int op::feed_request = 0xb0ebae01;
+const int op::feed_response = 0x54d37287;
+const int op::relayer_feed_update = 0x12A34217;
+
+const int op::excesses = 0xd53276db;
+const int op::update_config = 0x96e7f528;
+const int op::halt = 0x139a1b4e;
+const int op::unhalt = 0x7247e7a5;

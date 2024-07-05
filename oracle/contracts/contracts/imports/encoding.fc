@@ -1,0 +1,62 @@
+#include "constants.fc";
+#include "slice.fc";
+
+(int, int, int, int) ecrecover(int hash, int v, int r, int s) asm "ECRECOVER NULLSWAPIFNOT NULLSWAPIFNOT2";
+
+forall X -> int keccak(X s, int h) asm "HASHEXT_KECCAK256";
+;; int keccak2(slice s, slice s2, int h) asm "HASHEXT_KECCAK256";
+
+(int) recover_address(int hash, slice signature) inline {
+    int r = signature~load_uint(256);
+    int s = signature~load_uint(256);
+    int v = signature~load_uint(8);
+
+    var (_, x, y, bool) = ecrecover(hash, v >= 27 ? v - 27 : v, r, s);
+
+    if (~ bool) {
+        return bool;
+    }
+
+    builder pub_key = begin_cell().store_uint(x, 256).store_uint(y, 256);
+
+    return keccak(pub_key, 1) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF;
+}
+
+(int) get_data_package_signer_address(slice data, slice signature) inline {
+    var hash = keccak(data, 1);
+
+    return recover_address(hash, signature);
+}
+
+(int, int, int) parse_data_package(slice data) inline_ref {
+    int dp_count = data~slice_uint(DATA_POINTS_COUNT_BITS);
+    throw_unless(error::data_not_supported_base + dp_count, dp_count == 1);
+
+    int value_size_bits = data~slice_uint(DATA_POINT_VALUE_BYTE_SIZE_BITS) * 8;
+    throw_unless(error::data_not_supported_base + value_size_bits, value_size_bits <= MAX_PRICE_VALUE_SIZE_BITS);
+    throw_unless(error::data_not_supported_base + value_size_bits, value_size_bits > 0);
+
+    int timestamp = data~slice_uint(TIMESTAMP_SIZE);
+    int value = data~slice_uint(value_size_bits);
+    int feed_id = data~slice_uint(DATA_FEED_ID_BITS);
+
+    if (feed_id != 0) {
+        while (feed_id == (feed_id / 256) * 256) {
+            feed_id = feed_id / 256;
+        }
+    }
+
+    data.end_parse();
+
+    return (feed_id, value, timestamp);
+}
+
+(int, int, int, int) get_data_package_values(slice data_package_slice) inline_ref {
+    cell data_cell = data_package_slice~load_ref();
+    slice data = data_cell.begin_parse();
+
+    int address = get_data_package_signer_address(data, data_package_slice);
+    var (feed_id, value, timestamp) = parse_data_package(data);
+
+    return (address, feed_id, value, timestamp);
+}

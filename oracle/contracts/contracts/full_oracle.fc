@@ -1,0 +1,558 @@
+#include "imports/stdlib.fc";
+#include "imports/constants.fc";
+#include "imports/tuple.fc";
+#include "imports/dict.fc";
+#include "imports/time.fc";
+#include "imports/message.fc";
+#include "imports/slice.fc";
+#include "imports/encoding.fc";
+
+
+;; =============== storage ====================
+
+global int storage::halted;
+global int storage::min_request_amount;
+global int storage::cache_ttl;
+global slice storage::request_data_wallet_address;
+global slice storage::admin_address;
+global int storage::signer_count_threshold;
+global cell storage::trusted_signers; ;; trusted signers tuple
+global cell storage::trusted_consumers; ;; trusted price consumers tuple
+
+
+global int storage::timestamp;
+global cell storage::prices; ;; prices dict
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+
+    storage::halted = ds~load_int(BOOL_SIZE);
+    storage::min_request_amount = ds~load_uint(INT_32_LEN);
+    storage::cache_ttl = ds~load_uint(INT_32_LEN);
+    storage::request_data_wallet_address = ds~load_msg_addr();
+    storage::admin_address = ds~load_msg_addr();
+    storage::signer_count_threshold = ds~load_uint(SIGNER_COUNT_TRESHOLD_SIZE);
+    storage::trusted_signers = ds~load_ref();
+    storage::trusted_consumers = ds~load_ref();
+
+    slice rs = ds~load_ref().begin_parse();
+    storage::timestamp = rs~load_uint(TIMESTAMP_SIZE);
+    storage::prices = rs.slice_refs_empty?() ? new_dict() : rs~load_ref();
+
+    ;; initialize 0 feed_id to handle second feed skips in requsts
+    storage::prices~udict_set_uint(
+        KEY_LENGTH_BITS,
+       0,
+        MAX_PRICE_VALUE_SIZE_BITS,
+        0
+    );
+}
+
+() save_data() impure inline {
+    set_data(begin_cell()
+        .store_int(storage::halted, BOOL_SIZE)
+        .store_uint(storage::min_request_amount, INT_32_LEN)
+        .store_uint(storage::cache_ttl, INT_32_LEN)
+        .store_slice(storage::request_data_wallet_address)
+        .store_slice(storage::admin_address)
+        .store_uint(storage::signer_count_threshold, SIGNER_COUNT_TRESHOLD_SIZE)
+        .store_ref(storage::trusted_signers)
+        .store_ref(storage::trusted_consumers)
+        .store_ref(
+            begin_cell()
+                .store_uint(storage::timestamp, TIMESTAMP_SIZE)
+                .store_ref(storage::prices)
+            .end_cell()
+        )
+    .end_cell());
+}
+
+
+;; =============== helpers ===================
+
+(cell, int) make_matrix(cell data_packages_dict, int expected_data_package_count, tuple data_feed_ids, tuple signers, int current_timestamp) inline {
+    cell matrix = new_dict();
+    int min_timestamp = 0xFFFFFFFFFFFFFFFF;
+
+    int key = -1;
+    int k = 0;
+
+    (key, slice data_package_slice, int f) = data_packages_dict.udict_get_next?(BASE_KEY_LEN, key);
+    while (f) {
+        var (address, feed_id, value, timestamp) = get_data_package_values(data_package_slice);
+
+        validate_timestamp(
+            key,
+            timestamp / 1000,
+            current_timestamp,
+            storage::cache_ttl,
+            MAX_DATA_TIMESTAMP_AHEAD_SECONDS
+        );
+
+        int signer_index = signers.index_of(address);
+        int feed_index = data_feed_ids.index_of(feed_id);
+
+        if ((signer_index != UNKNOWN_IDX) & (feed_index != UNKNOWN_IDX)) {
+            int index = signers.tlen() * feed_index + signer_index;
+            matrix~udict_set_uint(BASE_KEY_LEN, index, MAX_PRICE_VALUE_SIZE_BITS, value);
+            min_timestamp = min(min_timestamp, timestamp);
+        }
+
+        (key, data_package_slice, f) = data_packages_dict.udict_get_next?(BASE_KEY_LEN, key);
+        k = k + 1;
+    }
+
+
+    throw_unless(error::wrong_data_package_count_base + k, expected_data_package_count == k);
+
+    return (matrix, min_timestamp);
+}
+
+
+(tuple) verify_and_aggregate_results(cell matrix, int data_feeds_len, int signers_len, int signer_count_threshold) {
+    tuple result = empty_tuple();
+    int feed_index = 0;
+    while (feed_index < data_feeds_len) {
+        int signer_index = 0;
+        tuple values = empty_tuple();
+        while (signer_index < signers_len) {
+            (slice payl, int success) = matrix.udict_get?(BASE_KEY_LEN, signers_len * feed_index + signer_index);
+            if (success) {
+                values~tpush(payl~load_int(MAX_PRICE_VALUE_SIZE_BITS));
+            }
+            signer_index += 1;
+        }
+
+        throw_unless(error::unique_signers_threshould_not_achived_base + feed_index, values.tlen() >= signer_count_threshold);
+        result~tpush(values.median());
+        feed_index += 1;
+    }
+
+    return result;
+}
+
+(tuple, int) process_feed_data(cell payload, tuple data_feed_ids, tuple signers, int signer_count_threshold, int current_timestamp) inline_ref {
+    slice payload_slice = payload.begin_parse();
+
+    int marker = payload_slice~slice_uint(FARMIX_MARKER_BITS);
+    throw_unless(error::wrong_marker, marker == FARMIX_MARKER_BITS);
+
+    int unsigned_data_length = payload_slice~slice_uint(UNSIGNED_METADATA_BITS);
+    payload_slice~slice_uint(unsigned_data_length);
+
+    int data_package_count = payload_slice~slice_uint(DATA_PACKAGES_COUNT_BITS);
+    cell data_packages_dict = payload_slice~load_ref();
+
+    payload_slice.end_parse();
+
+    var (matrix, min_timestamp) = make_matrix(
+        data_packages_dict,
+        data_package_count,
+        data_feed_ids,
+        signers,
+        current_timestamp
+    );
+    tuple result = verify_and_aggregate_results(
+        matrix,
+        data_feed_ids.tlen(),
+        signers.tlen(),
+        signer_count_threshold
+    );
+
+    return (result, min_timestamp);
+}
+
+
+
+;; =============== messages ===================
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    ;; ignore empty messages (can be used as top up)
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    ;; check right workchain
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    ;; accept and ignore bounced messages
+    if (flags & 1) {
+        ;; TODO(fix it, in case of bounced message bounce message back to original consumer if possible)
+        return ();
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    (int wc, int wc_sender_addr) = parse_std_addr(sender_address);
+    throw_unless(error::wrong_workchain, wc == WORKCHAIN);
+
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+
+    if (op == op::price_request) {
+        throw_if(error::halted, storage::halted);
+        throw_unless(error::not_enough_amount, msg_value >= storage::min_request_amount);
+
+        tuple trusted_consumer = storage::trusted_consumers.tuple_deserialize_integers();
+        int consumer_idx = trusted_consumer.index_of(wc_sender_addr);
+        throw_if(error::not_allowd_sender, consumer_idx == UNKNOWN_IDX);
+
+        int force_refresh = in_msg_body~load_int(1);
+        int feed_id_1 = in_msg_body~load_uint(DATA_FEED_ID_BITS);
+        int feed_id_2 = in_msg_body~load_uint(DATA_FEED_ID_BITS);
+        cell proxy_payload = in_msg_body~load_ref();
+
+
+        (int feed_value_1, int feed_value_success_1) = storage::prices.udict_get_uint?(
+            KEY_LENGTH_BITS,
+            feed_id_1,
+            MAX_PRICE_VALUE_SIZE_BITS
+        );
+        (int feed_value_2, int feed_value_success_2) = storage::prices.udict_get_uint?(
+            KEY_LENGTH_BITS,
+            feed_id_2,
+            MAX_PRICE_VALUE_SIZE_BITS
+        );
+
+        ;; if contract already has price feeds
+        if (storage::timestamp != 0) {
+            throw_unless(error::price_feed_missing, feed_value_success_1);
+            throw_unless(error::price_feed_missing, feed_value_success_2);
+        }
+
+        int cache_expired = is_cache_expired(
+            storage::timestamp,
+            now(),
+            storage::cache_ttl
+        );
+
+        if (force_refresh | cache_expired) {
+            cell body = begin_cell()
+                .store_uint(op::feed_request, 32)
+                .store_uint(query_id, 64)
+                .store_slice(sender_address)
+                .store_uint(feed_id_1, DATA_FEED_ID_BITS)
+                .store_uint(feed_id_2, DATA_FEED_ID_BITS)
+                .store_ref(proxy_payload)
+            .end_cell();
+
+            send_simple_message(
+                BOUNCEABLE,
+                0,
+                storage::request_data_wallet_address,
+                body,
+                SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+            );
+        } else {
+            cell body = begin_cell()
+                .store_uint(op::price_response, 32)
+                .store_uint(query_id, 64)
+                .store_uint(storage::timestamp, TIMESTAMP_SIZE)
+                .store_uint(feed_id_1, DATA_FEED_ID_BITS)
+                .store_uint(feed_value_1, MAX_PRICE_VALUE_SIZE_BITS)
+                .store_ref(begin_cell()
+                    .store_uint(feed_id_2, DATA_FEED_ID_BITS)
+                    .store_uint(feed_value_2, MAX_PRICE_VALUE_SIZE_BITS)
+                .end_cell())
+                .store_ref(proxy_payload)
+            .end_cell();
+
+
+            send_simple_message(
+                NON_BOUNCEABLE,
+                0,
+                sender_address,
+                body,
+                SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+            );
+        }
+    }
+
+    if (op == op::feed_response) {
+        throw_unless(error::not_allowd_sender, equal_slice_bits(sender_address, storage::request_data_wallet_address));
+
+        slice original_consumer_address = in_msg_body~load_msg_addr();
+        int feed_id_1 = in_msg_body~load_uint(DATA_FEED_ID_BITS);
+        int feed_id_2 = in_msg_body~load_uint(DATA_FEED_ID_BITS);
+        cell proxy_payload = in_msg_body~load_ref();
+        cell data_feeds_cell = in_msg_body~load_ref();
+        cell payload_cell = in_msg_body~load_ref();
+
+        tuple data_feeds = data_feeds_cell.tuple_deserialize_integers();
+
+        try {
+            (tuple values, int min_timestamp) = process_feed_data(
+                payload_cell,
+                data_feeds,
+                tuple_deserialize_integers(storage::trusted_signers),
+                storage::signer_count_threshold,
+                now()
+            );
+
+            ;; update cache only if feeds are more fresh
+            if (min_timestamp > storage::timestamp) {
+                storage::timestamp = min_timestamp;
+                storage::prices = dict_from_keys_and_values(
+                    data_feeds,
+                    values,
+                    DATA_FEED_ID_BITS,
+                    MAX_PRICE_VALUE_SIZE_BITS
+                );
+            }
+
+
+            (int feed_value_1, int feed_value_success_1) = storage::prices.udict_get_uint?(
+                KEY_LENGTH_BITS,
+                feed_id_1,
+                MAX_PRICE_VALUE_SIZE_BITS
+            );
+            (int feed_value_2, int feed_value_success_2) = storage::prices.udict_get_uint?(
+                KEY_LENGTH_BITS,
+                feed_id_2,
+                MAX_PRICE_VALUE_SIZE_BITS
+            );
+
+
+            throw_unless(error::price_feed_missing, feed_value_success_1);
+            throw_unless(error::price_feed_missing, feed_value_success_2);
+
+
+            cell body = begin_cell()
+                .store_uint(op::price_response, 32)
+                .store_uint(query_id, 64)
+                .store_uint(storage::timestamp, TIMESTAMP_SIZE)
+                .store_uint(feed_id_1, DATA_FEED_ID_BITS)
+                .store_uint(feed_value_1, MAX_PRICE_VALUE_SIZE_BITS)
+                .store_ref(begin_cell()
+                    .store_uint(feed_id_2, DATA_FEED_ID_BITS)
+                    .store_uint(feed_value_2, MAX_PRICE_VALUE_SIZE_BITS)
+                    .end_cell())
+                .store_ref(proxy_payload)
+                .end_cell();
+
+            send_simple_message(
+                NON_BOUNCEABLE,
+                0,
+                original_consumer_address,
+                body,
+                SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+            );
+        } catch (exc_arg, exc_num) {
+            cell body = begin_cell()
+                .store_uint(op::price_response_failed, 32)
+                .store_uint(query_id, 64)
+                .store_ref(proxy_payload)
+            .end_cell();
+
+
+            send_simple_message(
+                NON_BOUNCEABLE,
+                0,
+                original_consumer_address,
+                body,
+                SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+            );
+        }
+    }
+
+    if (op == op::relayer_feed_update) {
+        throw_unless(error::not_allowd_sender, equal_slice_bits(sender_address, storage::request_data_wallet_address));
+
+        cell data_feeds_cell = in_msg_body~load_ref();
+        cell payload_cell = in_msg_body~load_ref();
+
+        tuple data_feeds = data_feeds_cell.tuple_deserialize_integers();
+        (tuple values, int min_timestamp) = process_feed_data(
+            payload_cell,
+            data_feeds,
+            tuple_deserialize_integers(storage::trusted_signers),
+            storage::signer_count_threshold,
+            now()
+        );
+
+        ;; update cache only if feeds are more fresh
+        if (min_timestamp > storage::timestamp) {
+            storage::timestamp = min_timestamp;
+            storage::prices = dict_from_keys_and_values(
+                data_feeds,
+                values,
+                DATA_FEED_ID_BITS,
+                MAX_PRICE_VALUE_SIZE_BITS
+            );
+        }
+
+        send_simple_message(
+            NON_BOUNCEABLE,
+            0,
+            sender_address,
+            begin_cell().store_uint(op::excesses, 32).store_uint(query_id, 64).end_cell(),
+            SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+        );
+    }
+
+    if (op == op::update_config) {
+        throw_unless(error::not_allowd_sender, equal_slice_bits(sender_address, storage::admin_address));
+
+        int min_request_amount = in_msg_body~load_uint(INT_32_LEN);
+        if (min_request_amount) {
+            storage::min_request_amount = min_request_amount;
+        }
+
+        int cache_ttl = in_msg_body~load_uint(INT_32_LEN);
+        if (cache_ttl) {
+            storage::cache_ttl = cache_ttl;
+        }
+
+        int signer_count_threshold = in_msg_body~load_uint(SIGNER_COUNT_TRESHOLD_SIZE);
+
+        if (signer_count_threshold) {
+            storage::signer_count_threshold = signer_count_threshold;
+        }
+
+        if (in_msg_body~load_int(1)) {
+             storage::request_data_wallet_address = in_msg_body~load_msg_addr();
+        }
+        if (in_msg_body~load_int(1)) {
+            storage::admin_address = in_msg_body~load_msg_addr();
+        }
+
+        if (in_msg_body~load_int(1)) {
+            cell trusted_signers = in_msg_body~load_ref();
+            storage::trusted_signers = trusted_signers;
+        }
+
+        if (in_msg_body~load_int(1)) {
+            cell trusted_consumers = in_msg_body~load_ref();
+            storage::trusted_consumers = trusted_consumers;
+        }
+
+        send_simple_message(
+            NON_BOUNCEABLE,
+            0,
+            sender_address,
+            begin_cell().store_uint(op::excesses, 32).store_uint(query_id, 64).end_cell(),
+            SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+        );
+    }
+
+    if (op == op::halt) {
+        throw_unless(error::not_allowd_sender, equal_slice_bits(sender_address, storage::admin_address));
+
+        storage::halted = true;
+
+        send_simple_message(
+            NON_BOUNCEABLE,
+            0,
+            sender_address,
+            begin_cell().store_uint(op::excesses, 32).store_uint(query_id, 64).end_cell(),
+            SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+        );
+    }
+
+    if (op == op::unhalt) {
+        throw_unless(error::not_allowd_sender, equal_slice_bits(sender_address, storage::admin_address));
+
+        storage::halted = false;
+
+        send_simple_message(
+            NON_BOUNCEABLE,
+            0,
+            sender_address,
+            begin_cell().store_uint(op::excesses, 32).store_uint(query_id, 64).end_cell(),
+            SEND_MODE_CARRY_REMAINING_INBOUD_VALUE + SEND_FLAG_IGNORE_SENDING_MESSAGE_ERRORS
+        );
+    }
+
+    save_data();
+}
+
+
+;; =============== getters ====================
+
+
+(tuple, int) get_cached_feed_data(tuple data_feed_ids) method_id {
+    load_data();
+
+    tuple dict = dict_values_for_keys(
+        storage::prices,
+        data_feed_ids,
+        DATA_FEED_ID_BITS,
+        MAX_PRICE_VALUE_SIZE_BITS,
+        0
+    );
+
+    return (dict, storage::timestamp);
+}
+
+(int) get_cached_feeds_timestamp() method_id {
+    load_data();
+
+    return storage::timestamp;
+}
+
+(int, int, int) get_cache_info() method_id {
+    load_data();
+
+    return (
+        storage::timestamp,
+        storage::cache_ttl,
+        is_cache_expired(storage::timestamp, now(), storage::cache_ttl)
+    );
+}
+
+(cell) get_config() method_id {
+    load_data();
+
+    return begin_cell()
+        .store_int(storage::halted, BOOL_SIZE)
+        .store_uint(storage::min_request_amount, INT_32_LEN)
+        .store_uint(storage::cache_ttl, INT_32_LEN)
+        .store_slice(storage::request_data_wallet_address)
+        .store_slice(storage::admin_address)
+        .store_uint(storage::signer_count_threshold, SIGNER_COUNT_TRESHOLD_SIZE)
+        .store_ref(storage::trusted_signers)
+        .store_ref(storage::trusted_consumers)
+    .end_cell();
+}
+
+
+(tuple, int) get_processed_feed_data(tuple data_feed_ids, cell payload) method_id {
+    load_data();
+
+    (tuple values, int min_timestamp) = process_feed_data(
+        payload,
+        data_feed_ids,
+        tuple_deserialize_integers(storage::trusted_signers),
+        storage::signer_count_threshold,
+        now()
+    );
+
+    return (values, min_timestamp);
+}
+
+(cell) get_processed_feed_data_cell(cell data_feed_ids, cell payload) method_id {
+    load_data();
+
+    (tuple values, _) = process_feed_data(
+        payload,
+        tuple_deserialize_integers(data_feed_ids),
+        tuple_deserialize_integers(storage::trusted_signers),
+        storage::signer_count_threshold,
+        now()
+    );
+
+    return values.tuple_to_cell(MAX_PRICE_VALUE_SIZE_BITS);
+}
+
+
+
+
+
+
+
+
+

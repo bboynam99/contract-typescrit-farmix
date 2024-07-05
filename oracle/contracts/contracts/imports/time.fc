@@ -1,0 +1,18 @@
+#include "constants.fc";
+
+(int) is_cache_expired(int cache_ts, int current_ts, int ttl) inline {
+    return (current_ts - cache_ts) > ttl;
+}
+
+(int) validate_timestamp(int index, int timestamp, int current_timestamp, max_delay_sec, max_ahead_sec) inline {
+    if (current_timestamp > timestamp) {
+        throw_if(error::timestamp_out_of_range + index, current_timestamp - timestamp > max_delay_sec);
+    }
+
+    if (timestamp > current_timestamp) {
+        throw_if(error::timestamp_out_of_range + index + 50, timestamp - current_timestamp > max_ahead_sec);
+    }
+
+    return true;
+}
+
