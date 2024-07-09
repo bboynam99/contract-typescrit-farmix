@@ -28,6 +28,25 @@ int liquidation::calculateLiquidationAmount(int borrow_amount, int liq_amount, i
  
 } 
 
+int liquidation::calculateHFForLeverage(int collateral_amount, int liquidation_threshold, int total_position_size, int price) {
+    ;; Расчет стоимости обеспечения
+    int collateral_value = muldiv(collateral_amount, price, 1000000000);  ;; Предполагаем, что price в формате с 9 десятичными знаками
+    
+    ;; Расчет максимальной суммы займа при текущей стоимости обеспечения
+    int max_borrow_value = muldiv(collateral_value, liquidation_threshold, 100);
+    
+    ;; Расчет текущей стоимости всей позиции
+    int current_position_value = muldiv(total_position_size, price, 1000000000);
+    
+    ;; Расчет текущей суммы займа (общая позиция минус обеспечение)
+    int current_borrow_value = current_position_value - collateral_value;
+    
+    ;; Расчет Health Factor
+    ;; HF = (Стоимость обеспечения * Liquidation Threshold) / Текущая сумма займа
+    int health_factor = muldiv(max_borrow_value, 100, current_borrow_value);
+    
+    return health_factor;
+}
 
 () liquidation::liquidationCallNativeToken(slice all_msg, int input_amount, slice liquidator, int price) impure {
         (slice owner_address, slice jetton_wallet_x_address, slice minter_otoken_address, slice jetton_wallet_otoken_address, slice oracle, cell borrow, cell lend, cell algebra) = storage::load_data();

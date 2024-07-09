@@ -10,6 +10,7 @@ int op::newBorrow() asm "0x186a0 PUSHINT";
 int op::newLendNativeToken() asm "0x186a1 PUSHINT"; 
 int op::deleteBorrowNativeToken() asm "0x186a2 PUSHINT";  
 int op::liquidationCallNativeToken() asm "0x186a3 PUSHINT"; 
+int op::dex_leverage() asm "0x186a4 PUSHINT";
 
 int query::newLendCustomToken() asm "0x15ba8 PUSHINT";
 int query::deleteLend() asm "0x15f90 PUSHINT";

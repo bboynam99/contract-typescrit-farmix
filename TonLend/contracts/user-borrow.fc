@@ -4,7 +4,9 @@
 #include "utils/codes.fc";
 #include "utils/exitcodes.fc";
 
-() borrow::newBorrow(slice in_msg_body, slice sender_address, int price) impure {
+global int hf;
+
+ () borrow::newBorrow(slice in_msg_body, slice sender_address, int price) impure {
         (slice owner_address, slice jetton_wallet_x_address, slice minter_otoken_address, slice jetton_wallet_otoken_address, slice oracle, cell borrow, cell lend, cell algebra) = storage::load_data();
         
         {- Check for create lend -}
@@ -110,6 +112,64 @@
 
         storage::save_data(owner_address, jetton_wallet_x_address, minter_otoken_address, jetton_wallet_otoken_address, oracle, borrow, lend, algebra);
         return ();
+} 
+
+() borrow::createLeverage(slice in_msg_body, slice sender_address, int price) impure {
+    (slice owner_address, slice jetton_wallet_x_address, slice minter_otoken_address, slice jetton_wallet_otoken_address, slice oracle, cell borrow, cell lend, cell algebra) = storage::load_data();
+    
+    int leverage = in_msg_body~load_uint(16);  ;; Читаем leverage как fixed-point число (например, 1.5x = 1500, 3x = 3000)
+    int collateral_amount = in_msg_body~load_grams();
+    
+    ;; Проверка, что leverage находится в допустимом диапазоне (1.5x - 3x)
+    throw_unless(err::invalid_leverage(), (leverage >= 1500) & (leverage <= 3000));
+    
+    (int ltv, int liquidationThreshold, int liquidationBonus, int borrowingEnabled, int isActive, int liquidityRate, int variableBorrowRate) = algebra::getConfiguration(algebra);
+    
+    ;; Проверка максимального доступного leverage
+    int max_leverage = algebra::getMaxLeverageForToken(ltv, price, collateral_amount);
+    throw_unless(err::leverage_too_high(), leverage <= max_leverage);
+    
+    ;; Расчет суммы займа
+    int borrow_amount = muldiv(collateral_amount, (leverage - 1000), 1000);
+    
+    ;; Расчет общей суммы позиции
+    int total_position_size = collateral_amount + borrow_amount;
+    
+    ;; Проверка health factor
+    int hf = liquidation::calculateHFForLeverage(collateral_amount, liquidationThreshold, total_position_size, price);
+    throw_unless(err::health_factor_too_low(), hf > 110);  ;; Используем более высокий HF для leverage
+    
+    ;; Создание займа
+    var (_, key_addr) = parse_std_addr(sender_address);
+    cell borrowCell = begin_cell()
+        .store_uint(3, 2)  ;; 3 для обозначения leverage
+        .store_slice(sender_address)
+        .store_uint(now(), 64)
+        .store_grams(borrow_amount)
+        .store_uint(price, 64)
+        .store_uint(leverage, 16)  ;; Сохраняем leverage
+    .end_cell();
+    borrow~udict_set_ref(256, key_addr, borrowCell);
+    
+    ;; Взаимодействие с DEX для открытия позиции с leverage
+    cell dex_interaction = begin_cell()
+        .store_uint(op::dex_leverage(), 32)
+        .store_uint(leverage, 16)
+        .store_grams(total_position_size)
+        .store_slice(sender_address)
+    .end_cell();
+    
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(oracle)
+        .store_grams(0)
+        .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(dex_interaction)
+    .end_cell();
+    send_raw_message(msg, 64);
+    
+    storage::save_data(owner_address, jetton_wallet_x_address, minter_otoken_address, jetton_wallet_otoken_address, oracle, borrow, lend, algebra);
+    return ();
 }
 
 () borrow::deleteBorrowNativeToken(slice in_msg_body, int amount, slice sender_address, int price) impure {
@@ -236,7 +296,6 @@
         lender_info~load_msg_addr();
         lender_info~load_uint(64);
         int lend_amount = lender_info~load_grams();
-
         slice borrow_info = (borrow.udict_get_maybe_ref(256, key_addr)).begin_parse();
         int typeBorrowAmount = borrow_info~load_uint(2);
         borrow_info~load_msg_addr();       
@@ -245,10 +304,15 @@
 
         throw_if(err::wrong_amount(), borrow_amount <= 0);
 
-        {- check HF -}
-        int hf = liquidation::calculateHFForNativeToken(lend_amount, liquidationThreshold, borrow_amount, price);
-        
-        throw_unless(0x249, hf > 105);
+    ;; Проверка Hf
+    if (typeBorrowAmount == 3) {  ;; Если это leverage
+         hf = liquidation::calculateHFForLeverage(lend_amount, liquidationThreshold, borrow_amount, price);
+    } else {
+         hf = liquidation::calculateHFForNativeToken(lend_amount, liquidationThreshold, borrow_amount, price);
+    }
+    
+    throw_unless(0x249, hf > 105);
+
 
         int borrow_time = (now() - time);
         if(borrow_time == 0) { borrow_time += 1; }

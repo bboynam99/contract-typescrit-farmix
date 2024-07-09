@@ -19,6 +19,24 @@ int algebra::pow(int b, int e) inline_ref {
         return v;
 }
 
+int algebra::getMaxLeverageForToken(int ltv, int price, int collateral_amount) {
+    ;; Максимальная сумма займа
+    int max_borrow = muldiv(collateral_amount, ltv, 100);
+    
+    ;; Максимальный размер позиции
+    int max_position_size = collateral_amount + max_borrow;
+    
+    ;; Расчет максимального leverage (в формате fixed-point, где 1000 = 1x)
+    int max_leverage = muldiv(max_position_size, 1000, collateral_amount);
+    
+    ;; Ограничиваем максимальный leverage до 3x (3000)
+    if (max_leverage > 3000) {
+        return 3000;
+    }
+    
+    return max_leverage;
+}
+
 cell algebra::pack_conf(int ltv, int liquidationThreshold, int liquidationBonus, int borrowingEnabled, int isActive, int liquidityRate, int variableBorrowRate) impure {
         return (begin_cell()
                 .store_uint(ltv, 64)
